@@ -1,0 +1,1830 @@
+package main
+
+import (
+	"log"
+
+	"github.com/DanRulev/vocabot.git/internal/bot"
+	"github.com/DanRulev/vocabot.git/internal/client"
+	"github.com/DanRulev/vocabot.git/internal/config"
+	"github.com/DanRulev/vocabot.git/internal/repository"
+	"github.com/DanRulev/vocabot.git/internal/service"
+	"github.com/DanRulev/vocabot.git/internal/storage/cache"
+	"github.com/DanRulev/vocabot.git/internal/storage/db"
+
+	"go.uber.org/zap"
+)
+
+func setupLogger(env string) *zap.Logger {
+	var logger *zap.Logger
+	if env == "development" {
+		logger, _ = zap.NewDevelopment()
+	} else {
+		logger, _ = zap.NewProduction()
+	}
+	return logger
+}
+
+func main() {
+	cfg, err := config.Init()
+	if err != nil {
+		log.Fatal("failed load config " + err.Error())
+		return
+	}
+
+	logger := setupLogger(cfg.Env)
+
+	db, err := db.InitDB(cfg.DB)
+	if err != nil {
+		logger.Fatal("failed init db", zap.Error(err))
+	}
+
+	repos := repository.NewRepository(db)
+
+	clients := client.InitClients()
+	services := service.InitServices(clients, repos, logger)
+	cache := cache.NewCache()
+
+	handler, err := bot.NewTelegramAPI(cfg.BotToken, cfg.Env, services, cache)
+	if err != nil {
+		logger.Fatal(err.Error())
+		return
+	}
+
+	handler.Start()
+}
+package bot
+
+import (
+	"log"
+
+	"github.com/DanRulev/vocabot.git/internal/storage/cache"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+type ServiceI interface {
+	WordSI
+	QuizSI
+}
+
+type BotSender interface {
+	Send(c tgbotapi.Chattable) (tgbotapi.Message, error)
+}
+
+type TelegramAPI struct {
+	bot  *tgbotapi.BotAPI
+	word *WordT
+	quiz *QuizT
+}
+
+func NewTelegramAPI(botToken, env string, service ServiceI, cache *cache.Cache) (*TelegramAPI, error) {
+	bot, err := tgbotapi.NewBotAPI(botToken)
+	if err != nil {
+		return nil, err
+	}
+
+	if env == "development" {
+		bot.Debug = true
+	} else {
+		bot.Debug = false
+	}
+
+	return &TelegramAPI{
+		bot:  bot,
+		word: NewWordTAPI(bot, cache, service),
+		quiz: NewQuizTAPI(bot, cache, service),
+	}, nil
+}
+
+func (t *TelegramAPI) Start() {
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+
+	updates := t.bot.GetUpdatesChan(u)
+
+	for update := range updates {
+		if update.Message != nil {
+			if update.Message.IsCommand() {
+				t.handleCommand(update.Message)
+			} else {
+				t.handleMessage(update.Message)
+			}
+			continue
+		}
+
+		if update.CallbackQuery != nil {
+			t.handleCallbackQuery(update.CallbackQuery)
+		}
+	}
+}
+
+func sendMessage(bot BotSender, msg tgbotapi.Chattable) {
+	sentMsg, err := bot.Send(msg)
+	if err != nil {
+		log.Printf("Failed to send message: %v", err)
+	} else {
+		log.Printf("Sent message to %d", sentMsg.Chat.ID)
+	}
+}
+package bot
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+	"github.com/DanRulev/vocabot.git/internal/storage/cache"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+type WordSI interface {
+	RandomWord(ctx context.Context) (string, models.WordCard, error)
+	AddWord(ctx context.Context, word models.WordCard) error
+	Words(ctx context.Context, userID int64, page int, learned bool) (string, bool, error)
+	WordStat(ctx context.Context, userID int64) (string, error)
+}
+
+type WordT struct {
+	bot     BotSender
+	cache   *cache.Cache
+	service WordSI
+}
+
+func NewWordTAPI(bot BotSender, cache *cache.Cache, service WordSI) *WordT {
+	return &WordT{
+		bot:     bot,
+		cache:   cache,
+		service: service,
+	}
+}
+
+func (t *WordT) sendNewWord(message *tgbotapi.Message, userID int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if message.From == nil {
+		log.Printf("Message without sender: %d", message.Chat.ID)
+		return
+	}
+
+	word, card, err := t.service.RandomWord(ctx)
+	if err != nil {
+		log.Printf("Failed to get random word for chat %d: %v", message.Chat.ID, err)
+		msg := tgbotapi.NewMessage(message.Chat.ID, "Ошибка при получении слова. Попробуй позже.")
+		sendMessage(t.bot, msg)
+		return
+	}
+
+	card.UserID = userID
+	t.cache.SetWord(userID, card)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		[]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("✅ Знаю", "know"),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Не знаю", "repeat"),
+		},
+	)
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, word)
+	msg.ParseMode = "markdown"
+	msg.ReplyMarkup = &keyboard
+
+	sendMessage(t.bot, msg)
+}
+
+func (t *WordT) showWords(message *tgbotapi.Message, userID int64, page int, learned bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	text, hasNext, err := t.service.Words(ctx, userID, page, learned) // true = learned
+	if err != nil {
+		log.Printf("Failed to load words for chat %d: %v", message.Chat.ID, err)
+		msg := tgbotapi.NewMessage(message.Chat.ID, "❌ Ошибка загрузки слов")
+		sendMessage(t.bot, msg)
+		return
+	}
+
+	knowPrefix := "f"
+	if learned {
+		knowPrefix = "t"
+	}
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, text)
+	msg.ParseMode = "markdown"
+	keyboard := t.wordPaginationKeyboard(knowPrefix, page, hasNext)
+	if keyboard != nil {
+		msg.ReplyMarkup = keyboard
+	}
+	sendMessage(t.bot, msg)
+}
+
+func (t *WordT) sendWordStats(message *tgbotapi.Message) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stats, err := t.service.WordStat(ctx, message.From.ID)
+	if err != nil {
+		log.Printf("Failed to get stats for chat %d: %v", message.Chat.ID, err)
+		msg := tgbotapi.NewMessage(message.Chat.ID, "❌ Ошибка")
+		sendMessage(t.bot, msg)
+		return
+	}
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, stats)
+	msg.ParseMode = "markdown"
+	sendMessage(t.bot, msg)
+}
+
+func (t *WordT) handleWordCallbackQuery(query *tgbotapi.CallbackQuery) {
+	data := query.Data
+
+	switch data {
+	case "know", "repeat":
+		t.handleWordResponse(query)
+	case "new_word":
+		if query.Message == nil {
+			log.Printf("CallbackQuery without message: %v", query.ID)
+			return
+		}
+		t.sendNewWord(query.Message, query.From.ID)
+	default:
+		log.Printf("Unknown callback data: %s", query.Data)
+		msg := tgbotapi.NewMessage(query.Message.Chat.ID, "❌ НЕИЗВЕСТНАЯ КОМАНДА")
+		msg.ParseMode = "markdown"
+		sendMessage(t.bot, msg)
+	}
+}
+
+func (t *WordT) handleWordResponse(query *tgbotapi.CallbackQuery) {
+	userID := query.From.ID
+	data := query.Data
+
+	word, exists := t.cache.GetWord(userID)
+	if !exists {
+		msg := tgbotapi.NewMessage(userID, "Не удалось определить слово.")
+		sendMessage(t.bot, msg)
+		return
+	}
+
+	t.cache.DeleteWord(userID)
+
+	var statusText string
+	switch data {
+	case "know":
+		word.Known = true
+		statusText = "✅ Отлично! Слово отмечено как выученное."
+	case "repeat":
+		word.Known = false
+		statusText = "❌ Запомнили. Повтори позже."
+	default:
+		return
+	}
+
+	word.UserID = userID
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := t.service.AddWord(ctx, word); err != nil {
+		log.Printf("Failed to save word for user %d: %v", userID, err)
+	}
+
+	fullText := fmt.Sprintf("%s\n\n%s", query.Message.Text, statusText)
+	editMsg := tgbotapi.NewEditMessageText(
+		query.Message.Chat.ID,
+		query.Message.MessageID,
+		fullText,
+	)
+	editMsg.ParseMode = "markdown"
+
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	buttons = append(buttons, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("❓ НОВОЕ СЛОВО", "new_word")})
+
+	editMsg.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: buttons}
+
+	sendMessage(t.bot, editMsg)
+}
+
+func (t *WordT) wordHandlePagination(query *tgbotapi.CallbackQuery) {
+	if query.Message == nil {
+		log.Printf("CallbackQuery without message from user %d", query.From.ID)
+		return
+	}
+	parts := strings.Split(query.Data, "_")
+	if len(parts) < 2 {
+		return
+	}
+
+	prefix := parts[0]
+	if prefix != "f" && prefix != "t" {
+		msg := tgbotapi.NewMessage(query.Message.Chat.ID, "❌ Ошибка: неверный формат страницы.")
+		sendMessage(t.bot, msg)
+		return
+	}
+	page, err := strconv.Atoi(parts[1])
+	if err != nil || page < 0 {
+		msg := tgbotapi.NewMessage(query.Message.Chat.ID, "❌ Ошибка: неверный номер страницы.")
+		sendMessage(t.bot, msg)
+		return
+	}
+
+	learned := prefix == "t"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	text, hasNext, err := t.service.Words(ctx, query.From.ID, page, learned)
+	if err != nil {
+		msg := tgbotapi.NewMessage(query.Message.Chat.ID, "❌ Ошибка загрузки слов")
+		sendMessage(t.bot, msg)
+		return
+	}
+	editMsg := tgbotapi.NewEditMessageText(
+		query.Message.Chat.ID,
+		query.Message.MessageID,
+		text,
+	)
+	editMsg.ParseMode = "markdown"
+	keyboard := t.wordPaginationKeyboard(prefix, page, hasNext)
+	if keyboard != nil {
+		editMsg.ReplyMarkup = keyboard
+	}
+
+	sendMessage(t.bot, editMsg)
+}
+
+func (t *WordT) wordPaginationKeyboard(prefix string, page int, hasNxt bool) *tgbotapi.InlineKeyboardMarkup {
+	var buttons [][]tgbotapi.InlineKeyboardButton
+
+	row := make([]tgbotapi.InlineKeyboardButton, 0, 2)
+
+	if page > 0 {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("◀️ Назад", fmt.Sprintf("%s_%d", prefix, page-1)))
+	}
+
+	if hasNxt {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("Далее ▶️", fmt.Sprintf("%s_%d", prefix, page+1)))
+	}
+
+	if len(row) > 0 {
+		buttons = append(buttons, row)
+	}
+
+	buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardButtonData("❓ НОВОЕ СЛОВО", "new_word"),
+		tgbotapi.NewInlineKeyboardButtonData("🏠 Главное меню", "main_menu"),
+	})
+
+	return &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: buttons}
+}
+package bot
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+	"github.com/DanRulev/vocabot.git/internal/storage/cache"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+type QuizSI interface {
+	NewQuiz(ctx context.Context, userID int64) (string, map[string]bool, error)
+	AddQuizResult(ctx context.Context, result models.QuizCard) error
+	QuizStats(ctx context.Context, userID int64) (string, error)
+}
+
+type QuizT struct {
+	bot     BotSender
+	cache   *cache.Cache
+	service QuizSI
+}
+
+func NewQuizTAPI(bot BotSender, cache *cache.Cache, service QuizSI) *QuizT {
+	return &QuizT{
+		bot:     bot,
+		cache:   cache,
+		service: service,
+	}
+}
+
+func (t *QuizT) sendNewQuiz(message *tgbotapi.Message, userID int64) {
+	ctx, canceled := context.WithTimeout(context.Background(), 10*time.Second)
+	defer canceled()
+
+	if message.From == nil {
+		log.Printf("Message without sender: %d", message.Chat.ID)
+		return
+	}
+
+	question, options, err := t.service.NewQuiz(ctx, userID)
+	if err != nil {
+		log.Printf("failed to get new quiz for chat: %d :%v", message.Chat.ID, err)
+		msg := tgbotapi.NewMessage(message.Chat.ID, "❌ Ошибка при получении викторины. Попробуй позже.")
+		sendMessage(t.bot, msg)
+		return
+	}
+
+	word := models.QuizCard{
+		UserID: userID,
+		Word:   question,
+		Type:   "quiz",
+	}
+
+	var buttons [][]tgbotapi.InlineKeyboardButton
+
+	row := make([]tgbotapi.InlineKeyboardButton, 0, 2)
+	i := 0
+
+	for answer, isCorrect := range options {
+		callbackData := "quiz_wrong"
+		if isCorrect {
+			word.Translation = answer
+			callbackData = "quiz_right"
+		}
+
+		button := tgbotapi.NewInlineKeyboardButtonData(answer, callbackData)
+		row = append(row, button)
+		i++
+
+		if i%2 == 0 {
+			buttons = append(buttons, row)
+			row = make([]tgbotapi.InlineKeyboardButton, 0, 2)
+		}
+	}
+
+	if len(row) > 0 {
+		buttons = append(buttons, row)
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, "❓ Как переводится: "+question)
+	msg.ParseMode = "markdown"
+	msg.ReplyMarkup = &keyboard
+
+	t.cache.SetQuiz(userID, word)
+
+	sendMessage(t.bot, msg)
+}
+
+func (t *QuizT) sendQuizStats(message *tgbotapi.Message) {
+	userID := message.From.ID
+	chatID := message.Chat.ID
+	ctx, canceled := context.WithTimeout(context.Background(), 5*time.Second)
+	defer canceled()
+
+	stats, err := t.service.QuizStats(ctx, userID)
+	if err != nil {
+		log.Printf("failed to get quiz stats for user %d: %v", userID, err)
+		msg := tgbotapi.NewMessage(chatID, "❌ Ошибка получения статистики")
+		sendMessage(t.bot, msg)
+		return
+	}
+
+	msg := tgbotapi.NewMessage(chatID, stats)
+	msg.ParseMode = "markdown"
+
+	sendMessage(t.bot, msg)
+}
+
+func (t *QuizT) handleQuizCallbackQuery(query *tgbotapi.CallbackQuery) {
+	data := query.Data
+
+	switch {
+	case data == "new_quiz":
+		if query.Message == nil {
+			log.Printf("CallbackQuery without message: %v", query.ID)
+			return
+		}
+		t.sendNewQuiz(query.Message, query.From.ID)
+	case strings.HasPrefix(data, "quiz_"):
+		t.processQuizAnswer(query)
+	default:
+		log.Printf("Unknown callback data: %s", query.Data)
+		msg := tgbotapi.NewMessage(query.Message.Chat.ID, "❌ НЕИЗВЕСТНАЯ КОМАНДА")
+		msg.ParseMode = "markdown"
+		sendMessage(t.bot, msg)
+	}
+}
+
+func (t *QuizT) processQuizAnswer(query *tgbotapi.CallbackQuery) {
+	userID := query.From.ID
+	data := query.Data
+
+	quiz, exists := t.cache.GetQuiz(userID)
+	if !exists {
+		log.Printf("failed to get quiz from cache for user %d", userID)
+		msg := tgbotapi.NewMessage(userID, "❌ Не удалось определить викторину.")
+		sendMessage(t.bot, msg)
+		return
+	}
+
+	t.cache.DeleteQuiz(userID)
+
+	quiz.IsCorrect = (data == "quiz_right")
+
+	statusText := "✅ Правильно! " + quiz.Translation
+	if !quiz.IsCorrect {
+		statusText = "❌ Неправильно. Повтори слово."
+	}
+
+	ctx, canceled := context.WithTimeout(context.Background(), 5*time.Second)
+	defer canceled()
+
+	err := t.service.AddQuizResult(ctx, quiz)
+	if err != nil {
+		log.Printf("failed to save quiz result for user %d: %v", userID, err)
+	}
+
+	fullText := fmt.Sprintf("%s\n\n%s", query.Message.Text, statusText)
+	editMsg := tgbotapi.NewEditMessageText(
+		query.Message.Chat.ID,
+		query.Message.MessageID,
+		fullText,
+	)
+	editMsg.ParseMode = "markdown"
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	buttons = append(buttons, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("❓ НОВАЯ ВИКТОРИНА", "new_quiz")})
+
+	editMsg.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: buttons}
+
+	sendMessage(t.bot, editMsg)
+}
+package bot
+
+import (
+	"log"
+	"strings"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+const (
+	ButtonNewWord         = "📚 Новое слово"
+	ButtonQuiz            = "🧠 Викторина"
+	ButtonMyWords         = "❗Мои слова"
+	ButtonProgress        = "📊 Мой прогресс"
+	ButtonWordProgress    = "📚 Слова"
+	ButtonQuizProgress    = "🧠 Викторины"
+	ButtonLearnedWords    = "✅ Выученные слова"
+	ButtonNotLearnedWords = "❌ Не выученные слова"
+	ButtonMainMenu        = "🏠 Главное меню"
+	ButtonBack            = "⏪ Назад"
+	ButtonHelp            = "ℹ️ Помощь"
+)
+
+func (t *TelegramAPI) handleCommand(message *tgbotapi.Message) {
+	switch message.Command() {
+	case "start":
+		t.handleStartCommand(message)
+	case "help":
+		t.handleHelpCommand(message)
+	default:
+		msg := tgbotapi.NewMessage(message.Chat.ID, "Неизвестная команда. Используй /start")
+		sendMessage(t.bot, msg)
+	}
+}
+
+func (t *TelegramAPI) handleStartCommand(message *tgbotapi.Message) {
+	welcomeText := "🤖 Привет! Я — бот для изучения английского языка!\n\n" +
+		"✨ Что я умею:\n" +
+		"• 📅 Показывать новое слово\n" +
+		"• 🧠 Проводить викторины\n" +
+		"• 📚 Помогать запоминать новые слова\n" +
+		"• 🔔 Напоминать учиться\n\n" +
+		"Нажми кнопку ниже, чтобы начать!"
+
+	keyboard := t.generateMenuKeyboard()
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, welcomeText)
+	msg.ReplyMarkup = keyboard
+
+	sendMessage(t.bot, msg)
+}
+
+func (t *TelegramAPI) showMainMenu(message *tgbotapi.Message) {
+	keyboard := t.generateMenuKeyboard()
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, "🏠 Главное меню:")
+	msg.ReplyMarkup = keyboard
+
+	sendMessage(t.bot, msg)
+}
+
+func (t *TelegramAPI) generateMenuKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	keyboard := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(ButtonNewWord),
+			tgbotapi.NewKeyboardButton(ButtonQuiz),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(ButtonMyWords),
+			tgbotapi.NewKeyboardButton(ButtonProgress),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(ButtonHelp),
+		),
+	)
+
+	keyboard.ResizeKeyboard = true
+	keyboard.OneTimeKeyboard = false
+
+	return keyboard
+}
+
+func (t *TelegramAPI) handleHelpCommand(message *tgbotapi.Message) {
+	helpText := `
+📚 Доступные команды:
+/start — запустить бота
+/help — это сообщение
+
+🎯 Используй кнопки:
+• "Слово дня" — новое слово каждый день
+• "Викторина" — проверь свои знания
+• "Мой прогресс" — сколько слов выучено
+• "Помощь" — подсказки и контакты
+`
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, helpText)
+	sendMessage(t.bot, msg)
+}
+
+func (t *TelegramAPI) handleMessage(message *tgbotapi.Message) {
+	if message.From == nil {
+		log.Printf("Message without sender: %d", message.Chat.ID)
+		return
+	}
+	userID := message.From.ID
+	text := message.Text
+
+	switch {
+	case text == ButtonNewWord:
+		t.word.sendNewWord(message, userID)
+	case text == ButtonQuiz:
+		t.quiz.sendNewQuiz(message, userID)
+	case text == ButtonMyWords:
+		t.showMyWordsMenu(message)
+	case text == ButtonProgress:
+		t.showProgressMenu(message)
+	case text == ButtonWordProgress:
+		t.word.sendWordStats(message)
+	case text == ButtonQuizProgress:
+		t.quiz.sendQuizStats(message)
+	case text == ButtonLearnedWords:
+		t.word.showWords(message, userID, 0, true)
+	case text == ButtonNotLearnedWords:
+		t.word.showWords(message, userID, 0, false)
+	case text == ButtonMainMenu || text == ButtonBack:
+		t.showMainMenu(message)
+	case text == ButtonHelp:
+		t.handleHelpCommand(message)
+
+	default:
+		msg := tgbotapi.NewMessage(message.Chat.ID, "Я не понял. Используй кнопки ниже.")
+		sendMessage(t.bot, msg)
+	}
+}
+
+func (t *TelegramAPI) showProgressMenu(message *tgbotapi.Message) {
+	keyboard := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(ButtonWordProgress),
+			tgbotapi.NewKeyboardButton(ButtonQuizProgress),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(ButtonBack),
+		),
+	)
+
+	keyboard.ResizeKeyboard = true
+	keyboard.OneTimeKeyboard = false
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, "Выбери тип статистики:")
+	msg.ReplyMarkup = keyboard
+
+	sendMessage(t.bot, msg)
+}
+
+func (t *TelegramAPI) showMyWordsMenu(message *tgbotapi.Message) {
+	keyboard := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(ButtonLearnedWords),
+			tgbotapi.NewKeyboardButton(ButtonNotLearnedWords),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(ButtonBack),
+		),
+	)
+
+	keyboard.ResizeKeyboard = true
+	keyboard.OneTimeKeyboard = false
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, "Выбери тип слов:")
+	msg.ReplyMarkup = keyboard
+
+	sendMessage(t.bot, msg)
+}
+
+func (t *TelegramAPI) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
+	callback := tgbotapi.NewCallback(query.ID, "")
+	callback.ShowAlert = false
+	if _, err := t.bot.Request(callback); err != nil {
+		log.Printf("Failed to answer callback: %v", err)
+	}
+
+	data := query.Data
+
+	switch {
+	case data == "know" || data == "repeat" || data == "new_word":
+		t.word.handleWordCallbackQuery(query)
+
+	case strings.HasPrefix(data, "f_") || strings.HasPrefix(data, "t_"):
+		t.word.wordHandlePagination(query)
+
+	case strings.HasPrefix(data, "quiz_") || data == "new_quiz":
+		t.quiz.handleQuizCallbackQuery(query)
+
+	case data == "main_menu":
+		t.showMainMenu(query.Message)
+
+	default:
+		log.Printf("Unknown callback data: %s from user %d", data, query.From.ID)
+	}
+}
+package client
+
+type Clients struct {
+	*MyMemoryAPI
+	*PythonAnyWhereAPI
+	*VercelAPI
+}
+
+func InitClients() Clients {
+	return Clients{
+		MyMemoryAPI:       NewMyMemoryAPI(),
+		PythonAnyWhereAPI: NewPythonAnyWhereAPI(),
+		VercelAPI:         NewVercelAPI(),
+	}
+}
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+)
+
+type MyMemoryAPI struct{}
+
+func NewMyMemoryAPI() *MyMemoryAPI {
+	return &MyMemoryAPI{}
+}
+
+func (m *MyMemoryAPI) TranslateEnToRu(ctx context.Context, text string) (models.MyMemoryTranslationResult, error) {
+	url := fmt.Sprintf(
+		"https://api.mymemory.translated.net/get?q=%s&langpair=en|ru",
+		url.QueryEscape(text),
+	)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return models.MyMemoryTranslationResult{}, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return models.MyMemoryTranslationResult{}, err
+	}
+	defer resp.Body.Close()
+
+	var data models.MyMemoryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return models.MyMemoryTranslationResult{}, err
+	}
+
+	if data.ResponseBody.ResponseStatus != 200 {
+		return models.MyMemoryTranslationResult{
+			Error: data.ResponseBody.ResponseDetails,
+		}, nil
+	}
+
+	var alternatives []string
+	for _, m := range data.Matches {
+		if m.Translation != data.ResponseBody.TranslatedText {
+			alternatives = append(alternatives, m.Translation)
+		}
+	}
+
+	return models.MyMemoryTranslationResult{
+		Text:         data.ResponseBody.TranslatedText,
+		Match:        data.ResponseBody.Match,
+		Source:       "en",
+		Target:       "ru",
+		Reliable:     data.ResponseBody.Match >= 0.8,
+		Alternatives: alternatives,
+	}, nil
+}
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+)
+
+type PythonAnyWhereAPI struct{}
+
+func NewPythonAnyWhereAPI() *PythonAnyWhereAPI {
+	return &PythonAnyWhereAPI{}
+}
+
+func (m *PythonAnyWhereAPI) DictionaryData(ctx context.Context, word string) (models.TranslationResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://ftapi.pythonanywhere.com/translate?sl=en&dl=ru&text="+word, nil)
+	if err != nil {
+		return models.TranslationResponse{}, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return models.TranslationResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	var result models.TranslationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return models.TranslationResponse{}, fmt.Errorf("failed to translate word: %v", word)
+	}
+
+	return result, nil
+}
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+)
+
+type VercelAPI struct{}
+
+func NewVercelAPI() *VercelAPI {
+	return &VercelAPI{}
+}
+
+func (v *VercelAPI) RandomWord(ctx context.Context) (string, error) {
+	resp, err := http.Get("https://random-word-api.vercel.app/api?words=1")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var word []string
+	if err = json.NewDecoder(resp.Body).Decode(&word); err != nil {
+		return "", errors.New("failed to get random word")
+	}
+
+	return word[0], nil
+}
+package config
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/DanRulev/vocabot.git/pkg/validator"
+	"github.com/spf13/viper"
+)
+
+type Config struct {
+	App      AppConfig `mapstructure:"app" validate:"required"`
+	BotToken string    `mapstructure:"bot_token" validate:"required"`
+	DB       DBConfig  `mapstructure:"db" validate:"required"`
+	Env      string    `mapstructure:"env" validate:"oneof=development production staging"`
+}
+
+type AppConfig struct {
+	Timeout time.Duration `mapstructure:"timeout" validate:"min=1"`
+}
+
+type DBConfig struct {
+	Conn DBConn `mapstructure:"conn"`
+	Cfg  DBCfg  `mapstructure:"cfg"`
+}
+
+type DBConn struct {
+	Host     string `mapstructure:"host" validate:"required"`
+	Port     string `mapstructure:"port" validate:"required"`
+	User     string `mapstructure:"user" validate:"required"`
+	Password string `mapstructure:"password" validate:"required"`
+	Name     string `mapstructure:"name" validate:"required"`
+	SSL      string `mapstructure:"ssl" validate:"oneof=disable require verify-full"`
+}
+
+type DBCfg struct {
+	MaxOpenConns    int           `mapstructure:"max_open_conns" validate:"min=1,max=1000"`
+	MaxIdleConns    int           `mapstructure:"max_idle_conns" validate:"min=0,max=100"`
+	ConnMaxLifeTime time.Duration `mapstructure:"conn_max_life_time" validate:"min=0"`
+	ConnMaxIdleTime time.Duration `mapstructure:"conn_max_idle_time" validate:"min=0"`
+}
+
+func Init() (*Config, error) {
+	v := viper.New()
+
+	v.AutomaticEnv()
+
+	configName := os.Getenv("CONFIG_NAME")
+	if configName == "" {
+		configName = "default"
+	}
+
+	v.AddConfigPath("configs")
+	v.SetConfigName(configName)
+
+	if err := v.BindEnv("bot_token", "BOT_TOKEN"); err != nil {
+		return nil, fmt.Errorf("failed to bind BOT_TOKEN: %w", err)
+	}
+	if err := v.BindEnv("db.conn.host", "DB_HOST"); err != nil {
+		return nil, fmt.Errorf("failed to bind DB_HOST: %w", err)
+	}
+	if err := v.BindEnv("db.conn.port", "DB_PORT"); err != nil {
+		return nil, fmt.Errorf("failed to bind DB_PORT: %w", err)
+	}
+	if err := v.BindEnv("db.conn.user", "DB_USER"); err != nil {
+		return nil, fmt.Errorf("failed to bind DB_USER: %w", err)
+	}
+	if err := v.BindEnv("db.conn.password", "DB_PASSWORD"); err != nil {
+		return nil, fmt.Errorf("failed to bind DB_PASSWORD: %w", err)
+	}
+	if err := v.BindEnv("db.conn.name", "DB_NAME"); err != nil {
+		return nil, fmt.Errorf("failed to bind DB_NAME: %w", err)
+	}
+	if err := v.BindEnv("db.conn.ssl", "DB_SSL"); err != nil {
+		return nil, fmt.Errorf("failed to bind DB_SSL: %w", err)
+	}
+
+	if err := v.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("failed to read config: %w", err)
+	}
+
+	cfg := Config{}
+
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	if err := validator.ValidateStruct(cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
+}
+package repository
+
+import (
+	"context"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+)
+
+type QuizR struct {
+	db QueryI
+}
+
+func NewQuizRepository(db QueryI) *QuizR {
+	return &QuizR{
+		db: db,
+	}
+}
+
+func (q *QuizR) AddQuizResult(ctx context.Context, result models.QuizCard) error {
+	query := `
+        INSERT INTO user_quiz_results (user_id, word, translation, type, is_correct)
+        VALUES ($1, $2, $3, $4, $5)
+    `
+
+	_, err := q.db.ExecContext(ctx, query, result.UserID, result.Word, result.Translation, result.Type, result.IsCorrect)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (q *QuizR) QuizStats(ctx context.Context, userID int64) (models.QuizStats, error) {
+	query := `SELECT 
+		COUNT(*) AS total_count,
+		COALESCE(SUM(CASE WHEN is_correct THEN 1 ELSE 0 END), 0) AS right_count
+	FROM user_quiz_results
+	WHERE user_id = $1`
+
+	var stats models.QuizStats
+	err := q.db.GetContext(ctx, &stats, query, userID)
+	if err != nil {
+		return models.QuizStats{}, err
+	}
+
+	stats.WrongCount = stats.TotalCount - stats.RightCount
+
+	return stats, nil
+}
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+)
+
+type WordsR struct {
+	db QueryI
+}
+
+func NewWordsRepository(db QueryI) *WordsR {
+	return &WordsR{db: db}
+}
+
+func (w *WordsR) AddWord(ctx context.Context, word models.WordCard) error {
+	query := `INSERT INTO user_words (user_id, word_text, translation, known, last_seen)
+		VALUES ($1, $2, $3, $4, NOW())
+		ON CONFLICT (user_id, word_text)
+		DO UPDATE SET
+			known = CASE 
+				WHEN EXCLUDED.known THEN true  
+				ELSE user_words.known            
+			END,
+			last_seen = NOW()
+		`
+	_, err := w.db.ExecContext(ctx, query, word.UserID, word.WordText, word.Translation, word.Known)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (w *WordsR) RandomUnknownWord(ctx context.Context, userID int64) (models.WordCard, error) {
+	query := `
+	SELECT word_text, translation
+		FROM user_words
+		WHERE user_id = $1 AND known = false
+		ORDER BY RANDOM()
+		LIMIT 1;
+	`
+
+	var word models.WordCard
+	err := w.db.GetContext(ctx, &word, query, userID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return models.WordCard{}, fmt.Errorf("no unknown words found for user %d", userID)
+		}
+		return models.WordCard{}, fmt.Errorf("database error: %w", err)
+	}
+	return word, nil
+}
+
+func (w *WordsR) Words(ctx context.Context, userID int64, offset int, known bool) ([]models.WordCard, int, error) {
+	var total int
+	countQuery := `SELECT COUNT(*) FROM user_words WHERE user_id = $1 AND known = $2`
+	err := w.db.GetContext(ctx, &total, countQuery, userID, known)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if total == 0 {
+		return []models.WordCard{}, 0, nil
+	}
+
+	query := `
+		SELECT user_id, word_text, translation, last_seen, known
+		FROM user_words
+		WHERE user_id = $1 AND known = $2
+		ORDER BY last_seen DESC
+		LIMIT 10 OFFSET $3
+	`
+	words := make([]models.WordCard, 0, 10)
+	err = w.db.SelectContext(ctx, &words, query, userID, known, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return words, total, nil
+}
+
+func (w *WordsR) WordStat(ctx context.Context, userID int64) (models.WordStats, error) {
+	query := `
+		SELECT
+			COUNT(*) AS total_count,
+			COALESCE(SUM(CASE WHEN known THEN 1 ELSE 0 END), 0) AS learned_count
+		FROM user_words
+		WHERE user_id = $1
+	`
+
+	var stats models.WordStats
+	err := w.db.GetContext(ctx, &stats, query, userID)
+	if err != nil {
+		return models.WordStats{}, fmt.Errorf("failed to get word stats for user %d: %w", userID, err)
+	}
+
+	stats.UnlearnedCount = stats.TotalCount - stats.LearnedCount
+
+	return stats, nil
+}
+package repository
+
+import (
+	"context"
+	"database/sql"
+)
+
+type QueryI interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+}
+
+type Repository struct {
+	*WordsR
+	*QuizR
+}
+
+func NewRepository(db QueryI) Repository {
+	return Repository{
+		WordsR: NewWordsRepository(db),
+		QuizR:  NewQuizRepository(db),
+	}
+}
+package service
+
+import (
+	"context"
+	crypto "crypto/rand"
+	"errors"
+	"fmt"
+	"math/big"
+	"math/rand"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+	"go.uber.org/zap"
+)
+
+type QuizRI interface {
+	AddQuizResult(ctx context.Context, result models.QuizCard) error
+	QuizStats(ctx context.Context, userID int64) (models.QuizStats, error)
+}
+
+type AuxiliaryWord interface {
+	AddWord(ctx context.Context, word models.WordCard) error
+	RandomUnknownWord(ctx context.Context, userID int64) (models.WordCard, error)
+}
+
+type QuizS struct {
+	myMemory       MyMemoryAPII
+	pythonAnyWhere PythonAnyWhereAPII
+	vercel         VercelAPII
+	repo           QuizRI
+	aux            AuxiliaryWord
+	log            *zap.Logger
+}
+
+func NewQuizService(api APII, repo QuizRI, aux AuxiliaryWord, log *zap.Logger) *QuizS {
+	return &QuizS{
+		myMemory:       api,
+		pythonAnyWhere: api,
+		vercel:         api,
+		repo:           repo,
+		aux:            aux,
+		log:            log,
+	}
+}
+
+func (q *QuizS) NewQuiz(ctx context.Context, userID int64) (string, map[string]bool, error) {
+	var target string
+
+	quiz := make(map[string]bool)
+	used := make(map[string]bool)
+
+	var (
+		mu          sync.Mutex
+		wg          sync.WaitGroup
+		errs        []error
+		maxAttempts = 5
+	)
+
+	truePosition, err := randomPosition(4)
+	if err != nil {
+		q.log.Warn("crypto/rand failed, using math/rand fallback", zap.Error(err))
+		truePosition = rand.Intn(4)
+	}
+
+	for i := 0; i < 4; i++ {
+		correctness := (truePosition == i)
+		wg.Add(1)
+		go func(correctness bool) {
+			defer wg.Done()
+
+			var translation string
+
+			for attempts := 0; attempts < maxAttempts; attempts++ {
+				word, err := q.vercel.RandomWord(ctx)
+				if err != nil {
+					mu.Lock()
+					errs = append(errs, fmt.Errorf("RandomWord failed: %w", err))
+					mu.Unlock()
+					continue
+				}
+				if correctness {
+					mu.Lock()
+					target = word
+					mu.Unlock()
+				}
+
+				trans, err := q.myMemory.TranslateEnToRu(ctx, word)
+				if err != nil {
+					mu.Lock()
+					errs = append(errs, fmt.Errorf("TranslateWord failed: %w", err))
+					mu.Unlock()
+					continue
+				}
+
+				if trans.Text == "" {
+					dictData, err := q.pythonAnyWhere.DictionaryData(ctx, word)
+					if err != nil {
+						mu.Lock()
+						errs = append(errs, fmt.Errorf("DictionaryData failed: %w", err))
+						mu.Unlock()
+						continue
+					}
+					if dictData.DestinationText == "" {
+						mu.Lock()
+						errs = append(errs, fmt.Errorf("translation empty: %v", word))
+						mu.Unlock()
+						continue
+					}
+					translation = dictData.DestinationText
+				} else {
+					translation = trans.Text
+				}
+
+				mu.Lock()
+				if !used[translation] {
+					used[translation] = true
+					mu.Unlock()
+					break
+				}
+				mu.Unlock()
+			}
+
+			mu.Lock()
+			quiz[translation] = correctness
+			mu.Unlock()
+		}(correctness)
+	}
+
+	wg.Wait()
+
+	if len(errs) > 0 {
+		q.log.Warn("errors during NewQuiz", zap.Int("error_count", len(errs)), zap.Errors("errors", errs))
+	}
+
+	if len(quiz) < 4 {
+		q.log.Warn("not enough unique translations", zap.Int("got", len(quiz)), zap.Int("required", 4))
+		return "", nil, errors.New("not enough unique translations")
+	}
+
+	return target, quiz, nil
+}
+
+func (q *QuizS) AddQuizResult(ctx context.Context, result models.QuizCard) error {
+	err := q.aux.AddWord(ctx, models.WordCard{
+		UserID:      result.UserID,
+		WordText:    result.Word,
+		Translation: result.Translation,
+		Known:       result.IsCorrect,
+	})
+	if err != nil {
+		q.log.Warn("failed to add word to user's dictionary", zap.Int64("user_id", result.UserID), zap.String("word", result.Word), zap.Error(err))
+	}
+	return q.repo.AddQuizResult(ctx, result)
+}
+
+func (q *QuizS) QuizStats(ctx context.Context, userID int64) (string, error) {
+	stats, err := q.repo.QuizStats(ctx, userID)
+	if err != nil {
+		q.log.Warn("failed to get quiz stats", zap.Int64("user_id", userID), zap.Error(err))
+		return "", err
+	}
+
+	return quizStatsFormat(stats), nil
+}
+
+func quizStatsFormat(stats models.QuizStats) string {
+	var sb strings.Builder
+
+	sb.WriteString("📚 *Всего попыток*: **")
+	sb.WriteString(strconv.Itoa(stats.TotalCount))
+	sb.WriteString("**\n\n")
+
+	sb.WriteString("📚 *Удачных*: **")
+	sb.WriteString(strconv.Itoa(stats.RightCount))
+	sb.WriteString("**\n\n")
+
+	sb.WriteString("📚 *Не удачных*: **")
+	sb.WriteString(strconv.Itoa(stats.WrongCount))
+	sb.WriteString("**")
+
+	return sb.String()
+}
+
+func randomPosition(max int64) (int, error) {
+	if max <= 0 {
+		return 0, errors.New("max must be greater than 0")
+	}
+
+	n, err := crypto.Int(crypto.Reader, big.NewInt(max))
+	if err != nil {
+		return 0, err
+	}
+
+	return int(n.Int64()), nil
+}
+package service
+
+import (
+	"context"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+	"go.uber.org/zap"
+)
+
+type MyMemoryAPII interface {
+	TranslateEnToRu(ctx context.Context, text string) (models.MyMemoryTranslationResult, error)
+}
+
+type PythonAnyWhereAPII interface {
+	DictionaryData(ctx context.Context, word string) (models.TranslationResponse, error)
+}
+
+type VercelAPII interface {
+	RandomWord(ctx context.Context) (string, error)
+}
+
+type APII interface {
+	MyMemoryAPII
+	PythonAnyWhereAPII
+	VercelAPII
+}
+
+type RepositoryI interface {
+	AuxiliaryWord
+	QuizRI
+	WordRI
+}
+
+type Service struct {
+	*WordS
+	*QuizS
+}
+
+func InitServices(api APII, repo RepositoryI, log *zap.Logger) *Service {
+	return &Service{
+		WordS: NewWordService(api, repo, log),
+		QuizS: NewQuizService(api, repo, repo, log),
+	}
+}
+package service
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+	"go.uber.org/zap"
+)
+
+type WordRI interface {
+	AddWord(ctx context.Context, word models.WordCard) error
+	Words(ctx context.Context, userID int64, offset int, know bool) ([]models.WordCard, int, error)
+	WordStat(ctx context.Context, userID int64) (models.WordStats, error)
+}
+
+type WordS struct {
+	myMemory       MyMemoryAPII
+	pythonAnyWhere PythonAnyWhereAPII
+	vercel         VercelAPII
+	repo           WordRI
+	log            *zap.Logger
+}
+
+func NewWordService(api APII, repo WordRI, log *zap.Logger) *WordS {
+	return &WordS{
+		myMemory:       api,
+		pythonAnyWhere: api,
+		vercel:         api,
+		repo:           repo,
+		log:            log,
+	}
+}
+
+func (w *WordS) RandomWord(ctx context.Context) (string, models.WordCard, error) {
+	var (
+		word        string
+		translate   models.MyMemoryTranslationResult
+		translation string
+		err         error
+		maxAttempts = 5
+	)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		word, err = w.vercel.RandomWord(ctx)
+		if err != nil {
+			w.log.Error("failed to get random word from Vercel", zap.Int("attempt", attempt), zap.Error(err))
+			if attempt == maxAttempts {
+				return "", models.WordCard{}, fmt.Errorf("couldn't get the word after %d attempts: %w", maxAttempts, err)
+			}
+			continue
+		}
+		if word == "" {
+			w.log.Warn("empty word received", zap.Int("attempt", attempt))
+			continue
+		}
+
+		translate, err = w.myMemory.TranslateEnToRu(ctx, word)
+		if err != nil {
+			w.log.Error("failed to translate word", zap.String("word", word), zap.Int("attempt", attempt), zap.Error(err))
+			continue
+		}
+		if translate.Text == "" {
+			w.log.Warn("empty translate word")
+			continue
+		}
+
+		translation = translate.Text
+
+		break
+	}
+
+	dictData, err := w.pythonAnyWhere.DictionaryData(ctx, word)
+	if err != nil {
+		w.log.Error("failed to get dictionary data for word", zap.Error(err), zap.String("word", word))
+		dictData.SourceText = word
+	}
+
+	if translation == "" {
+		if dictData.DestinationText == "" {
+			w.log.Error("failed to get any translation for word", zap.String("word", word))
+			return "", models.WordCard{}, fmt.Errorf("failed to translate word '%s'", word)
+		}
+		translation = dictData.DestinationText
+	}
+
+	if dictData.DestinationText == "" {
+		dictData.DestinationText = translation
+	}
+
+	formatted := formatTranslation(translate, dictData)
+
+	wordCard := models.WordCard{
+		WordText:    word,
+		Translation: translation,
+	}
+
+	return formatted, wordCard, nil
+}
+
+func formatTranslation(translate models.MyMemoryTranslationResult, dictData models.TranslationResponse) string {
+	var sb strings.Builder
+
+	sourceText := dictData.SourceText
+	if sourceText == "" {
+		sourceText = "Unknown"
+	}
+
+	sb.WriteString("📚 *Слово*: **")
+	sb.WriteString(escapeMarkdown(sourceText))
+	sb.WriteString("**\n\n")
+
+	translatedText := translate.Text
+	if translatedText == "" {
+		if dictData.DestinationText != "" {
+			translatedText = dictData.DestinationText
+		} else {
+			translatedText = "неизвестно"
+		}
+	}
+
+	sb.WriteString("🇷🇺 *Перевод*: ")
+	sb.WriteString(escapeMarkdown(translatedText))
+	sb.WriteString("\n")
+
+	if phonetic := dictData.Pronunciation.SourceTextPhonetic; phonetic != "" {
+		sb.WriteString("🔤 *Произношение*: `")
+		sb.WriteString(escapeMarkdown(phonetic))
+		sb.WriteString("`\n\n")
+	} else {
+		sb.WriteString("\n")
+	}
+
+	if len(dictData.Definitions) > 0 {
+		for i, def := range dictData.Definitions {
+			if i > 0 {
+				sb.WriteString("\n")
+			}
+
+			sb.WriteString("🔖 *")
+			sb.WriteString(escapeMarkdown(def.PartOfSpeech))
+			sb.WriteString("*\n")
+
+			sb.WriteString("📖 ")
+			sb.WriteString(escapeMarkdown(def.Definition))
+
+			if def.Example != "" {
+				sb.WriteString("\n💬 _")
+				sb.WriteString(escapeMarkdown(def.Example))
+				sb.WriteString("_")
+			}
+
+			if len(def.OtherExamples) > 0 {
+				sb.WriteString("\n📎 *Другие примеры*:\n")
+				for _, ex := range def.OtherExamples {
+					sb.WriteString("  • `")
+					sb.WriteString(escapeMarkdown(ex))
+					sb.WriteString("`\n")
+				}
+			}
+
+			if len(def.Synonyms) > 0 {
+				sb.WriteString("🔁 *Синонимы*:\n")
+				for pos, syms := range def.Synonyms {
+					sb.WriteString("  ")
+					sb.WriteString(escapeMarkdown(pos))
+					sb.WriteString(": ")
+					sb.WriteString(strings.Join(escapeSlice(syms), ", "))
+					sb.WriteString("\n")
+				}
+			}
+			sb.WriteString("\n")
+		}
+	} else {
+		sb.WriteString("⚠️ Нет словарных данных.\n")
+	}
+
+	if len(translate.Alternatives) > 0 {
+		sb.WriteString("🔄 *Альтернативные переводы*: ")
+		uniqueAlts := removeDuplicates(translate.Alternatives)
+		sb.WriteString(strings.Join(escapeSlice(uniqueAlts), ", "))
+		sb.WriteString("\n")
+	}
+
+	if translate.Match > 0 {
+		quality := "низкое"
+		if translate.Match >= 0.7 {
+			quality = "высокое"
+		} else if translate.Match >= 0.4 {
+			quality = "среднее"
+		}
+		sb.WriteString(fmt.Sprintf("📊 *Качество перевода*: %.1f (%s)\n", translate.Match, quality))
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+func escapeMarkdown(text string) string {
+	for _, c := range []string{"_", "*", "#", "!"} {
+		text = strings.ReplaceAll(text, c, "\\"+c)
+	}
+	return text
+}
+
+func escapeSlice(strs []string) []string {
+	result := make([]string, len(strs))
+	for i, s := range strs {
+		result[i] = escapeMarkdown(s)
+	}
+	return result
+}
+
+func removeDuplicates(slice []string) []string {
+	seen := make(map[string]bool)
+	result := make([]string, 0)
+	for _, item := range slice {
+		if !seen[item] {
+			seen[item] = true
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func (w *WordS) AddWord(ctx context.Context, word models.WordCard) error {
+	return w.repo.AddWord(ctx, word)
+}
+
+func (w *WordS) Words(ctx context.Context, userID int64, page int, learned bool) (string, bool, error) {
+	words, total, err := w.repo.Words(ctx, userID, page*10, learned)
+	if err != nil {
+		return "", false, err
+	}
+	if total == 0 || len(words) == 0 {
+		return "", false, fmt.Errorf("empty list")
+	}
+
+	return formatWords(words, total, page, learned), (page+1)*10 < total, nil
+}
+
+func formatWords(words []models.WordCard, total, page int, know bool) string {
+	var sb strings.Builder
+
+	totalPages := total / 10
+	if total%10 != 0 {
+		totalPages += 1
+	}
+
+	sb.WriteString(fmt.Sprintf("📚 Страница (%d/%d) | Всего слов (%d):\n\n", page+1, totalPages, total))
+
+	for i, word := range words {
+		num := (page * 10) + i + 1
+		sb.WriteString(fmt.Sprintf("%d. **%s** → *%s*\n",
+			num,
+			escapeMarkdown(word.WordText),
+			escapeMarkdown(word.Translation),
+		))
+
+		sb.WriteString("   📖 last seen: ")
+		sb.WriteString(word.LastSeen.Format(time.DateOnly))
+
+		if i < len(words)-1 {
+			sb.WriteString("\n")
+		}
+	}
+
+	return sb.String()
+}
+
+func (w *WordS) WordStat(ctx context.Context, userID int64) (string, error) {
+	stats, err := w.repo.WordStat(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+
+	return formatWordStats(stats), nil
+}
+
+func formatWordStats(stats models.WordStats) string {
+	var sb strings.Builder
+
+	sb.WriteString("📚 *Всего отмечено слов*: **")
+	sb.WriteString(strconv.Itoa(stats.TotalCount))
+	sb.WriteString("**\n\n")
+
+	sb.WriteString("📚 *Выучено*: **")
+	sb.WriteString(strconv.Itoa(stats.LearnedCount))
+	sb.WriteString("**\n\n")
+
+	sb.WriteString("📚 *Предстоит запомнить*: **")
+	sb.WriteString(strconv.Itoa(stats.UnlearnedCount))
+	sb.WriteString("**")
+
+	return sb.String()
+}
+package cache
+
+import (
+	"sync"
+
+	"github.com/DanRulev/vocabot.git/internal/models"
+)
+
+type Cache struct {
+	mu    sync.Mutex
+	words map[int64]models.WordCard
+	quiz  map[int64]models.QuizCard
+}
+
+func NewCache() *Cache {
+	return &Cache{
+		words: make(map[int64]models.WordCard),
+		quiz:  make(map[int64]models.QuizCard),
+	}
+}
+
+func (w *Cache) SetWord(userID int64, word models.WordCard) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.words[userID] = word
+}
+
+func (w *Cache) GetWord(userID int64) (models.WordCard, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	word, exists := w.words[userID]
+	return word, exists
+}
+
+func (w *Cache) DeleteWord(userID int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.words, userID)
+}
+
+func (w *Cache) SetQuiz(userID int64, quiz models.QuizCard) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.quiz[userID] = quiz
+}
+
+func (w *Cache) GetQuiz(userID int64) (models.QuizCard, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	quiz, exists := w.quiz[userID]
+	return quiz, exists
+}
+
+func (w *Cache) DeleteQuiz(userID int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.quiz, userID)
+}
+package db
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/DanRulev/vocabot.git/internal/config"
+	_ "github.com/lib/pq"
+
+	"github.com/jmoiron/sqlx"
+)
+
+func InitDB(cfg config.DBConfig) (*sqlx.DB, error) {
+	dsn := fmt.Sprintf("host=%v port=%v dbname=%v user=%v password=%v sslmode=%v",
+		cfg.Conn.Host, cfg.Conn.Port, cfg.Conn.Name, cfg.Conn.User, cfg.Conn.Password, cfg.Conn.SSL)
+	db, err := sqlx.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed open db connect: %w", err)
+	}
+
+	db.SetMaxOpenConns(cfg.Cfg.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.Cfg.MaxIdleConns)
+	db.SetConnMaxLifetime(cfg.Cfg.ConnMaxLifeTime)
+	db.SetConnMaxIdleTime(cfg.Cfg.ConnMaxIdleTime)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed db ping: %w", err)
+	}
+
+	return db, nil
+}
+package validator
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/go-playground/validator/v10"
+)
+
+var validate *validator.Validate
+
+func init() {
+	validate = validator.New()
+}
+
+func ValidateStruct(s interface{}) error {
+	if err := validate.Struct(s); err != nil {
+		var errMsgs []string
+		for _, err := range err.(validator.ValidationErrors) {
+			errMsgs = append(errMsgs, fmt.Sprintf(
+				"Field: %s, Tag: %s, Param: %s", err.Field(), err.Tag(), err.Param(),
+			))
+		}
+		return fmt.Errorf("validation failed: %s", strings.Join(errMsgs, "; "))
+	}
+	return nil
+}
